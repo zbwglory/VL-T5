@@ -670,3 +670,231 @@ class VLSeq2SeqLMOutput(ModelOutput):
     vis_encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
 
     # cross_encoder_outputs: Optional[Tuple[torch.FloatTensor]] = None
+
+
+
+class T5(T5ForConditionalGeneration):
+    def __init__(self, config):
+        super(T5ForConditionalGeneration, self).__init__(config)
+
+        self.config = config
+
+        self.model_dim = config.d_model
+
+        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+
+        encoder_config = copy.deepcopy(config)
+        encoder_config.is_decoder = False
+        encoder_config.use_cache = False
+        encoder_config.is_encoder_decoder = False
+
+        #---- Modified ----#
+        self.encoder = T5Stack(encoder_config, self.shared)
+        #------------------#
+
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+
+        self.decoder = T5Stack(decoder_config, self.shared)
+
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        self.init_weights()
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+
+    # @add_start_docstrings_to_callable(T5_INPUTS_DOCSTRING)
+    # @replace_return_docstrings(output_type=Seq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        encoder_outputs=None,
+
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        past_key_values=None,
+        use_cache=None,
+        labels=None,
+        inputs_embeds=None,
+        decoder_inputs_embeds=None,
+        head_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        reduce_loss=False,
+
+        return_hidden_state=False,
+
+        **kwargs,
+    ):
+
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if encoder_outputs is None:
+
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(
+                    encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2] if len(
+                    encoder_outputs) > 2 else None,
+            )
+
+        hidden_states = encoder_outputs[0]
+
+        if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+            # get decoder inputs from shifting lm labels to the right
+            decoder_input_ids = self._shift_right(labels)
+
+        # If decoding with past key value states, only the last tokens
+        # should be given as an input
+        if past_key_values is not None:
+            assert labels is None, "Decoder should not use cached key value states when training."
+            if decoder_input_ids is not None:
+                decoder_input_ids = decoder_input_ids[:, -1:]
+            if decoder_inputs_embeds is not None:
+                decoder_inputs_embeds = decoder_inputs_embeds[:, -1:]
+
+        if attention_mask is None:
+            attention_mask = input_ids.ne(self.config.pad_token_id).to(dtype=hidden_states.dtype, device=hidden_states.device)
+        encoder_attention_mask = attention_mask
+
+        # Decode
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            inputs_embeds=decoder_inputs_embeds,
+            past_key_values=past_key_values,
+
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+
+            head_mask=head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        # print('decoder_outputs')
+        # print(decoder_outputs)
+
+        sequence_output = decoder_outputs[0]
+
+        assert self.config.tie_word_embeddings is True
+
+        if self.config.tie_word_embeddings:
+            # Rescale output before projecting on vocab
+            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
+            sequence_output = sequence_output * (self.model_dim ** -0.5)
+
+        if return_hidden_state:
+            return sequence_output
+
+        lm_logits = self.lm_head(sequence_output)
+
+        loss = None
+        if labels is not None:
+            # loss_fct = CrossEntropyLoss(ignore_index=-100)
+            # loss = loss_fct(
+            #     lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
+            # TODO(thom): Add z_loss https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L666
+
+            if reduce_loss:
+                loss_fct = CrossEntropyLoss(ignore_index=-100)
+            else:
+                loss_fct = CrossEntropyLoss(ignore_index=-100, reduction='none')
+            loss = loss_fct(
+                lm_logits.view(-1, lm_logits.size(-1)),
+                labels.view(-1))
+
+            # print('loss')
+            # print(loss)
+
+        # if not return_dict:
+        #     output = (lm_logits,) + decoder_outputs[1:] + encoder_outputs
+        #     return ((loss,) + output) if loss is not None else output
+
+        return VLSeq2SeqLMOutput(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_last_hidden_state=decoder_outputs.last_hidden_state,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            # decoder_attentions=decoder_outputs.attentions,
+            # encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            # encoder_hidden_states=encoder_outputs.hidden_states,
+            # encoder_attentions=encoder_outputs.attentions,
+            # vis_encoder_last_hidden_state=vis_encoder_outputs.last_hidden_state,
+            # vis_encoder_hidden_states=vis_encoder_outputs.hidden_states,
+            # vis_encoder_attentions=vis_encoder_outputs.attentions,
+            # cross_encoder_outputs=cross_encoder_outputs
+        )
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past=None, attention_mask=None, use_cache=None,
+        encoder_outputs=None,
+        **kwargs):
+
+        # cut decoder_input_ids if past is used
+        if past is not None:
+            input_ids = input_ids[:, -1:]
+
+        output = {
+            "decoder_input_ids": input_ids,
+            "past_key_values": past,
+            "encoder_outputs": encoder_outputs,
+            "attention_mask": attention_mask,
+            "use_cache": use_cache,
+        }
+
+        return output
+
+    @staticmethod
+    def _expand_inputs_for_generation(
+        input_ids: torch.LongTensor,
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        attention_mask: torch.LongTensor = None,
+        encoder_outputs: ModelOutput = None,
+        **model_kwargs
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        expanded_return_idx = (
+            torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1,
+                                                                expand_size).view(-1).to(input_ids.device)
+        )
+        input_ids = input_ids.index_select(0, expanded_return_idx)
+
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = token_type_ids.index_select(
+                0, expanded_return_idx)
+
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.index_select(
+                0, expanded_return_idx)
+
+        if is_encoder_decoder:
+            assert encoder_outputs is not None
+            encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+                0, expanded_return_idx
+            )
+            model_kwargs["encoder_outputs"] = encoder_outputs
+
+        return input_ids, model_kwargs
+
